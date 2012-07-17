@@ -1,10 +1,11 @@
+// Package workers implements a simple scheme for parcelling out work to other processes over
+// a network via RPC.
 package workers
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/rpc"
 	"sync"
@@ -15,6 +16,7 @@ import (
 // Dials a master, serves rpc
 type Worker struct {
 	server *rpc.Server
+	conn   net.Conn
 }
 
 // NewWorker creates a worker.
@@ -28,14 +30,29 @@ func (w *Worker) Register(t interface{}) {
 	w.server.Register(t)
 }
 
-// Connect connects to a manager process. It blocks.
+//func (w *Worker) Close() {
+//}
+
+// Connect connects to a manager process. It blocks until the connection is closed, generally when
+// the Manager shuts down.
 func (w *Worker) Connect(managerAddr string) error {
+	if w.conn != nil {
+		return errors.New("Already connected")
+	}
 	conn, err := net.Dial("tcp", managerAddr)
 	if err != nil {
 		return fmt.Errorf("Error dialing: %v", err)
 	}
+	w.conn = conn
 	w.server.ServeConn(conn)
 	return nil
+}
+
+func (w *Worker) Close() {
+	if w.conn != nil {
+		w.conn.Close()
+		w.conn = nil
+	}
 }
 
 // Manager process
@@ -64,20 +81,24 @@ type workerConn struct {
 }
 
 type work struct {
-	Args  interface{}
-	Reply interface{}
-	Done  chan error
+	Service string
+	Args    interface{}
+	Reply   interface{}
+	Done    chan error
 }
 
 // Manager manages worker connections and allocates units of work to them.
 type Manager struct {
-	in   chan work
-	lock sync.Mutex
+	in       chan work
+	closing  chan struct{}
+	listener net.Listener
+	lock     sync.Mutex
 }
 
 func NewManager() *Manager {
 	m := new(Manager)
 	m.in = make(chan work, 1)
+	m.closing = make(chan struct{})
 	return m
 }
 
@@ -89,6 +110,7 @@ func (m *Manager) ServeConn(conn net.Conn) {
 	worker := &workerConn{client, wrapped}
 	wrapped.worker = worker
 	done := make(chan bool)
+	closing := m.closing
 	for {
 		select {
 		case w, ok := <-m.in:
@@ -96,8 +118,7 @@ func (m *Manager) ServeConn(conn net.Conn) {
 				return
 			}
 			go func(w work) {
-				log.Printf("Processing on %v\n", conn.RemoteAddr())
-				err := client.Call("T.Doit", w.Args, w.Reply)
+				err := client.Call(w.Service, w.Args, w.Reply)
 				w.Done <- err
 				if err != nil {
 					done <- true
@@ -105,15 +126,18 @@ func (m *Manager) ServeConn(conn net.Conn) {
 			}(w)
 		case <-done:
 			return
+		case <-closing:
+			conn.Close()
+			return
 		}
 	}
 }
 
-func (m *Manager) ProcessRequest(args interface{}, reply interface{}) error {
+func (m *Manager) Call(service string, args interface{}, reply interface{}) error {
 	done := make(chan error, 1)
 	timeout := time.Second
 	select {
-	case m.in <- work{args, reply, done}:
+	case m.in <- work{service, args, reply, done}:
 		err := <-done
 		return err
 	case <-time.After(timeout):
@@ -122,21 +146,33 @@ func (m *Manager) ProcessRequest(args interface{}, reply interface{}) error {
 	return nil
 }
 
+// Close stops listening and closes all active connections.
+func (m *Manager) Close() {
+	if m.listener != nil {
+		m.listener.Close()
+		m.listener = nil
+	}
+	close(m.closing)
+}
+
 // ListenAndServe listens for worker connections and serves them.
 // It blocks.
 func (m *Manager) ListenAndServe(addr string) error {
+	if m.listener != nil {
+		return errors.New("Already listening")
+	}
 	l, e := net.Listen("tcp", addr)
 	if e != nil {
 		return fmt.Errorf("Error listening: %v", e)
 	}
+	m.listener = l
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			log.Printf("Accept error %T %v\n", err, err)
+			break
 		} else {
 			go m.ServeConn(conn)
 		}
 	}
 	return nil
 }
-
