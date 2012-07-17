@@ -1,5 +1,10 @@
-// Package workers implements a simple scheme for parcelling out work to other processes over
-// a network via RPC.
+/*
+Package workers implements a simple scheme for parcelling out work to other processes over
+a network via RPC.
+
+One process will be have a Manager, accepting connections from Workers. The manager makes
+RPC calls to the workers, potentially load-balancing among them (not yet implemented).
+*/
 package workers
 
 import (
@@ -29,9 +34,6 @@ func NewWorker() *Worker {
 func (w *Worker) Register(t interface{}) {
 	w.server.Register(t)
 }
-
-//func (w *Worker) Close() {
-//}
 
 // Connect connects to a manager process. It blocks until the connection is closed, generally when
 // the Manager shuts down.
@@ -95,6 +97,7 @@ type Manager struct {
 	lock     sync.Mutex
 }
 
+// NewManager creates a manager.
 func NewManager() *Manager {
 	m := new(Manager)
 	m.in = make(chan work, 1)
@@ -102,8 +105,8 @@ func NewManager() *Manager {
 	return m
 }
 
-// ServeConn serves a connection to a worker. It blocks until the worker hangs up
-// or some other error occurs.
+// ServeConn serves a connection to a worker. It blocks until the worker hangs up,
+// or some other error occurs, or until the manager is closed.
 func (m *Manager) ServeConn(conn net.Conn) {
 	wrapped := &wrappedConn{conn, nil}
 	client := rpc.NewClient(wrapped)
@@ -133,6 +136,7 @@ func (m *Manager) ServeConn(conn net.Conn) {
 	}
 }
 
+// Call forwards a service call to a worker.
 func (m *Manager) Call(service string, args interface{}, reply interface{}) error {
 	done := make(chan error, 1)
 	timeout := time.Second

@@ -55,7 +55,7 @@ func TestWorkers(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	done := make(chan bool)
 	w1 := DoWorker(t, defaultManagerAddress, "abc", done)
-	w2 := 0// DoWorker(t, defaultManagerAddress, "abc", done)
+	w2 := DoWorker(t, defaultManagerAddress, "abc", done)
 
 	for i := 0; i < 5; i++ {
 		str := fmt.Sprintf("call %d", i)
@@ -76,5 +76,5 @@ func TestWorkers(t *testing.T) {
 	_, _ = w1, w2
 	m.Close()
 	<-done
-//	<-done
+	<-done
 }
