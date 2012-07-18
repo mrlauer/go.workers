@@ -9,9 +9,9 @@ To install
 
 Use godoc to see the documentation:
 
- godoc -http=":6060"
+    godoc -http=":6060"
 
 and browse to
 
- localhost:6060/pkg/github.com/mrlauer/go.workers/
+    localhost:6060/pkg/github.com/mrlauer/go.workers/
 
