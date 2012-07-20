@@ -8,11 +8,14 @@ RPC calls to the workers, potentially load-balancing among them (not yet impleme
 package workers
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/rpc"
+	"sync"
 	"time"
 )
 
@@ -79,6 +82,9 @@ func (w wrappedConn) Read(data []byte) (int, error) {
 type workerConn struct {
 	client      *rpc.Client
 	wrappedConn *wrappedConn
+	pending     int
+	index       int
+	done        chan bool
 }
 
 type work struct {
@@ -88,11 +94,118 @@ type work struct {
 	Done    chan error
 }
 
+// The heap that will manage worker load balancing.
+type workerHeap []*workerConn
+
+func (h workerHeap) Less(i, j int) bool {
+	return h[i].pending < h[j].pending
+}
+
+func (h *workerHeap) Len() int {
+	return len(*h)
+}
+
+func (h workerHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index, h[j].index = i, j
+}
+
+func (h *workerHeap) Push(x interface{}) {
+	w := x.(*workerConn)
+	w.index = h.Len()
+	*h = append(*h, w)
+}
+
+func (h *workerHeap) Pop() interface{} {
+	a := *h
+	n := len(a)
+	if n == 0 {
+		return nil
+	}
+	*h = a[:n-1]
+	a[n-1].index = -1
+	return a[n-1]
+}
+
+type workerPool struct {
+	heap       *workerHeap
+	popChan    chan *workerConn
+	pushChan   chan *workerConn
+	removeChan chan *workerConn
+}
+
+func (p *workerPool) Init() {
+	var h workerHeap
+	p.heap = &h
+	heap.Init(p.heap)
+	p.popChan = make(chan *workerConn)
+	p.pushChan = make(chan *workerConn)
+	p.removeChan = make(chan *workerConn)
+	go p.run()
+}
+
+func (p workerPool) PopWorker() *workerConn {
+	return <-p.popChan
+}
+
+func (p workerPool) PushWorker(w *workerConn) {
+	p.pushChan <- w
+}
+
+func (p workerPool) RemoveWorker(w *workerConn) {
+	p.removeChan <- w
+}
+
+// run is the loop that processes requests to push/pop/remove workers.
+// It seems kind of complicated, but this effectively creates a heap
+// where pops on an empty heap will wait for something to be inserted.
+func (p workerPool) run() {
+	var top *workerConn
+	for {
+		if top != nil {
+			select {
+			case p.popChan <- top:
+				if p.heap.Len() == 0 {
+					top = nil
+				} else {
+					top, _ = heap.Pop(p.heap).(*workerConn)
+				}
+			case w := <-p.pushChan:
+				if w.pending < top.pending {
+					top, w = w, top
+				}
+				heap.Push(p.heap, w)
+			case w := <-p.removeChan:
+				if w == top {
+					if p.heap.Len() == 0 {
+						top = nil
+					} else {
+						top, _ = heap.Pop(p.heap).(*workerConn)
+					}
+				} else {
+					if w.index >= 0 {
+						heap.Remove(p.heap, w.index)
+					}
+				}
+			}
+		} else {
+			select {
+			case w := <-p.pushChan:
+				top = w
+			case <-p.removeChan:
+				log.Printf("Removing from empty heap")
+			}
+		}
+	}
+}
+
 // Manager manages worker connections and allocates units of work to them.
 type Manager struct {
-	in       chan work
-	closing  chan struct{}
-	listener net.Listener
+	in           chan work
+	closing      chan struct{}
+	pool         workerPool
+	listener     net.Listener
+	dispatchLock sync.Mutex
 }
 
 // NewManager creates a manager.
@@ -100,7 +213,46 @@ func NewManager() *Manager {
 	m := new(Manager)
 	m.in = make(chan work, 1)
 	m.closing = make(chan struct{})
+	m.pool.Init()
+
+	go func() {
+		for {
+			select {
+			case w := <-m.in:
+				m.dispatch(w)
+			case <-m.closing:
+				return
+			}
+		}
+	}()
 	return m
+}
+
+func (m *Manager) dispatch(w work) error {
+	m.dispatchLock.Lock()
+	defer m.dispatchLock.Unlock()
+	worker := m.pool.PopWorker()
+	if worker == nil {
+		err := errors.New("No worker")
+		w.Done <- err
+		return err
+	}
+	worker.pending++
+	m.pool.PushWorker(worker)
+	go func() {
+		err := worker.client.Call(w.Service, w.Args, w.Reply)
+		w.Done <- err
+		if err != nil {
+			m.pool.RemoveWorker(worker)
+		} else {
+			m.dispatchLock.Lock()
+			defer m.dispatchLock.Unlock()
+			m.pool.RemoveWorker(worker)
+			worker.pending--
+			m.pool.PushWorker(worker)
+		}
+	}()
+	return nil
 }
 
 // ServeConn serves a connection to a worker. It blocks until the worker hangs up,
@@ -108,25 +260,12 @@ func NewManager() *Manager {
 func (m *Manager) ServeConn(conn net.Conn) {
 	wrapped := &wrappedConn{conn, nil}
 	client := rpc.NewClient(wrapped)
-	worker := &workerConn{client, wrapped}
+	worker := &workerConn{client: client, wrappedConn: wrapped}
 	wrapped.worker = worker
-	done := make(chan bool)
 	closing := m.closing
+	m.pool.PushWorker(worker)
 	for {
 		select {
-		case w, ok := <-m.in:
-			if !ok {
-				return
-			}
-			go func(w work) {
-				err := client.Call(w.Service, w.Args, w.Reply)
-				w.Done <- err
-				if err != nil {
-					done <- true
-				}
-			}(w)
-		case <-done:
-			return
 		case <-closing:
 			conn.Close()
 			return

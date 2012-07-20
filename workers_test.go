@@ -63,31 +63,36 @@ func TestWorkers(t *testing.T) {
 		wg.Add(1)
 		DoWorker(t, defaultManagerAddress, i, wg)
 	}
+	time.Sleep(time.Millisecond * 10)
 
 	keycount := make(map[int]int)
+	var callgroup sync.WaitGroup
+	callgroup.Add(ncalls)
 	for i := 0; i < ncalls; i++ {
-		str := fmt.Sprintf("call %d", i)
-		var reply Result
-		err := m.Call("Foo.Bar", Args{str}, &reply)
-		if err != nil {
-			t.Errorf("Error calling %d: %v", i, err)
-		}
-		if reply.Result != str {
-			t.Errorf("Call %d returned %s, not %s", i, reply.Result, str)
-		}
-		keycount[reply.Key] += 1
+		go func(i int) {
+			str := fmt.Sprintf("call %d", i)
+			var reply Result
+			err := m.Call("Foo.Bar", Args{str}, &reply)
+			if err != nil {
+				t.Errorf("Error calling %d: %v", i, err)
+			}
+			if reply.Result != str {
+				t.Errorf("Call %d returned %s, not %s", i, reply.Result, str)
+			}
+			keycount[reply.Key] += 1
+			callgroup.Done()
+		}(i)
 	}
+	callgroup.Wait()
 	// Check keys
 	if len(keycount) != nworkers {
 		t.Errorf("calls went to %d workers, not %d", len(keycount), nworkers)
 	}
-	/*
-		for k, ct := range keycount {
-			if ct != callfac {
-				t.Errorf("key %d had %d calls", k, ct)
-			}
+	for k, ct := range keycount {
+		if ct != callfac {
+			t.Errorf("key %d had %d calls", k, ct)
 		}
-	*/
+	}
 
 	// Close the server and make sure the workers die.
 	m.Close()
