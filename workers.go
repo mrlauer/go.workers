@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"net/rpc"
-	"sync"
 	"time"
 )
 
@@ -94,7 +93,6 @@ type Manager struct {
 	in       chan work
 	closing  chan struct{}
 	listener net.Listener
-	lock     sync.Mutex
 }
 
 // NewManager creates a manager.
