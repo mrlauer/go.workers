@@ -127,6 +127,11 @@ func (h *workerHeap) Pop() interface{} {
 	return a[n-1]
 }
 
+// workerPool manages a priority queue of workerConns.
+// See http://concur.rspace.googlecode.com/hg/talk/concur.html#slide-49 for
+// the basic idea.
+// This implementation is more complicated, to allow Pops to wait nicely for
+// worker connections to become available.
 type workerPool struct {
 	heap       *workerHeap
 	popChan    chan *workerConn
@@ -138,6 +143,7 @@ func (p *workerPool) Init() {
 	var h workerHeap
 	p.heap = &h
 	heap.Init(p.heap)
+	// These channels must be unbuffered, or else synchronization problems may ensue.
 	p.popChan = make(chan *workerConn)
 	p.pushChan = make(chan *workerConn)
 	p.removeChan = make(chan *workerConn)
@@ -228,7 +234,11 @@ func NewManager() *Manager {
 	return m
 }
 
+// dispatch sends a unit of work to a worker. It does not
+// wait for the result.
 func (m *Manager) dispatch(w work) error {
+	// We need dispatchLock so changes to Pending will be atomic.
+	// It might be better to move that to the pool, but this is simpler.
 	m.dispatchLock.Lock()
 	defer m.dispatchLock.Unlock()
 	worker := m.pool.PopWorker()
