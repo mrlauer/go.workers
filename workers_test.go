@@ -63,9 +63,9 @@ func TestWorkers(t *testing.T) {
 		wg.Add(1)
 		DoWorker(t, defaultManagerAddress, i, wg)
 	}
-	time.Sleep(time.Millisecond * 10)
 
 	keycount := make(map[int]int)
+	var kclock sync.Mutex
 	var callgroup sync.WaitGroup
 	callgroup.Add(ncalls)
 	for i := 0; i < ncalls; i++ {
@@ -79,7 +79,9 @@ func TestWorkers(t *testing.T) {
 			if reply.Result != str {
 				t.Errorf("Call %d returned %s, not %s", i, reply.Result, str)
 			}
+			kclock.Lock()
 			keycount[reply.Key] += 1
+			kclock.Unlock()
 			callgroup.Done()
 		}(i)
 	}
