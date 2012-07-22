@@ -34,7 +34,7 @@ func exampleManager(managerAddr string) *Manager {
 
 // In this example we'll start one manager and two workers
 // in the same process.
-func ExampleManager() {
+func Example() {
 	addr := "127.0.0.1:1234"
 	m := exampleManager(addr)
 	time.Sleep(time.Millisecond)
