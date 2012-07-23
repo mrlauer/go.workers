@@ -127,6 +127,14 @@ func (h *workerHeap) Pop() interface{} {
 	return a[n-1]
 }
 
+func (h workerHeap) String() string {
+	var p []int
+	for _, w := range h {
+		p = append(p, w.pending)
+	}
+	return fmt.Sprint(p)
+}
+
 // workerPool manages a priority queue of workerConns.
 // See http://concur.rspace.googlecode.com/hg/talk/concur.html#slide-49 for
 // the basic idea.
@@ -135,8 +143,10 @@ func (h *workerHeap) Pop() interface{} {
 type workerPool struct {
 	heap       *workerHeap
 	popChan    chan *workerConn
+	getChan    chan *workerConn
 	pushChan   chan *workerConn
 	removeChan chan *workerConn
+	lock       sync.Mutex
 }
 
 func (p *workerPool) Init() {
@@ -145,27 +155,46 @@ func (p *workerPool) Init() {
 	heap.Init(p.heap)
 	// These channels must be unbuffered, or else synchronization problems may ensue.
 	p.popChan = make(chan *workerConn)
+	p.getChan = make(chan *workerConn)
 	p.pushChan = make(chan *workerConn)
 	p.removeChan = make(chan *workerConn)
 	go p.run()
 }
 
-func (p workerPool) PopWorker() *workerConn {
+func (p *workerPool) PopWorker() *workerConn {
 	return <-p.popChan
 }
 
-func (p workerPool) PushWorker(w *workerConn) {
+func (p *workerPool) GetWorker() *workerConn {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	//	  w := <-p.getChan
+	w := <-p.popChan
+	w.pending++
+	p.pushChan <- w
+	return w
+}
+
+func (p *workerPool) PushWorker(w *workerConn) {
 	p.pushChan <- w
 }
 
-func (p workerPool) RemoveWorker(w *workerConn) {
+func (p *workerPool) RemoveWorker(w *workerConn) {
 	p.removeChan <- w
+}
+
+func (p *workerPool) FinishWorker(w *workerConn) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.removeChan <- w
+	w.pending--
+	p.pushChan <- w
 }
 
 // run is the loop that processes requests to push/pop/remove workers.
 // It seems kind of complicated, but this effectively creates a heap
 // where pops on an empty heap will wait for something to be inserted.
-func (p workerPool) run() {
+func (p *workerPool) run() {
 	var top *workerConn
 	for {
 		if top != nil {
@@ -176,6 +205,10 @@ func (p workerPool) run() {
 				} else {
 					top, _ = heap.Pop(p.heap).(*workerConn)
 				}
+			case p.getChan <- top:
+				top.pending++
+				heap.Push(p.heap, top)
+				top = heap.Pop(p.heap).(*workerConn)
 			case w := <-p.pushChan:
 				if w.pending < top.pending {
 					top, w = w, top
@@ -207,11 +240,10 @@ func (p workerPool) run() {
 
 // Manager manages worker connections and allocates units of work to them.
 type Manager struct {
-	in           chan work
-	closing      chan struct{}
-	pool         workerPool
-	listener     net.Listener
-	dispatchLock sync.Mutex
+	in       chan work
+	closing  chan struct{}
+	pool     workerPool
+	listener net.Listener
 }
 
 // NewManager creates a manager.
@@ -237,29 +269,19 @@ func NewManager() *Manager {
 // dispatch sends a unit of work to a worker. It does not
 // wait for the result.
 func (m *Manager) dispatch(w work) error {
-	// We need dispatchLock so changes to Pending will be atomic.
-	// It might be better to move that to the pool, but this is simpler.
-	m.dispatchLock.Lock()
-	defer m.dispatchLock.Unlock()
-	worker := m.pool.PopWorker()
+	worker := m.pool.GetWorker()
 	if worker == nil {
 		err := errors.New("No worker")
 		w.Done <- err
 		return err
 	}
-	worker.pending++
-	m.pool.PushWorker(worker)
 	go func() {
 		err := worker.client.Call(w.Service, w.Args, w.Reply)
 		w.Done <- err
 		if err != nil {
 			m.pool.RemoveWorker(worker)
 		} else {
-			m.dispatchLock.Lock()
-			defer m.dispatchLock.Unlock()
-			m.pool.RemoveWorker(worker)
-			worker.pending--
-			m.pool.PushWorker(worker)
+			m.pool.FinishWorker(worker)
 		}
 	}()
 	return nil

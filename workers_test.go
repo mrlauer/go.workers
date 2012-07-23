@@ -53,7 +53,7 @@ func DoManager(t *testing.T, addr string) *Manager {
 
 func TestWorkers(t *testing.T) {
 	nworkers := 10
-	callfac := 5
+	callfac := 10
 	ncalls := nworkers * callfac
 
 	m := DoManager(t, defaultManagerAddress)
